@@ -61,11 +61,13 @@ find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 set(dependencies
   rclcpp
   rclcpp_components
   geometry_msgs
+  tf2_ros
   nav_msgs
   sensor_msgs
   std_msgs

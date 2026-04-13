@@ -114,22 +114,27 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(ouster_ros::Point,
 
 namespace livox_ros
 {
+// Must match livox_ros_driver2 PointCloud2 (LivoxPointXyzrtlt): field "intensity" + "timestamp", packed layout.
+#pragma pack(push, 1)
 typedef struct {
-  float x;            /**< X axis, Unit:m */
-  float y;            /**< Y axis, Unit:m */
-  float z;            /**< Z axis, Unit:m */
-  float reflectivity; /**< Reflectivity   */
-  uint8_t tag;        /**< Livox point tag   */
-  uint8_t line;       /**< Laser line id     */
+  float x;
+  float y;
+  float z;
+  float reflectivity; /**< maps from ROS field name "intensity" */
+  uint8_t tag;
+  uint8_t line;
+  double timestamp;
 } LivoxPointXyzrtl;
-}
+#pragma pack(pop)
+}  // namespace livox_ros
 POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (float, x, x)
     (float, y, y)
     (float, z, z)
-    (float, reflectivity, reflectivity)
+    (float, reflectivity, intensity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
+    (double, timestamp, timestamp)
 )
 
 class Preprocess

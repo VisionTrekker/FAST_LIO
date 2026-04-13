@@ -37,6 +37,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <iomanip>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -44,6 +45,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -86,6 +88,9 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+string odom_frame_id, odom_child_frame_id;
+Eigen::Isometry3d g_T_livox_base = Eigen::Isometry3d::Identity();
+bool g_compose_odom_to_base_link = false;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -283,9 +288,15 @@ void lasermap_fov_segment()
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
-    scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
+    printf("[standard_pcl_cbk] 点云header.stamp(s): %.6f\n", cur_time);
     double preprocess_start_time = omp_get_wtime();
+    scan_count ++;
+
+    // 获取当前系统时间
+    auto sys_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -304,6 +315,10 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+
+    std::cerr << "[standard_pcl_cbk] 系统时间戳(ms): " << sys_time_ms
+              << "，点云header.stamp(s): " << std::fixed << std::setprecision(9) << cur_time
+              << "，二者延迟(ms): " << (sys_time_ms - static_cast<int64_t>(cur_time * 1000.0)) << std::endl;
 }
 
 double timediff_lidar_wrt_imu = 0.0;
@@ -347,8 +362,92 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
+void mid360LidHandler(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+{
+    double cur_time = get_time_sec(msg->header.stamp);
+    scan_count ++;
+    if (scan_count % 2 == 0) return;
+    double preprocess_start_time = omp_get_wtime();
+    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    {
+        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        lidar_buffer.clear();
+    }
+    if(is_first_lidar)
+    {
+        is_first_lidar = false;
+    }
+    last_timestamp_lidar = cur_time;
+
+    if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
+    {
+        printf("IMU and LiDAR not Synced, IMU time: %lf, lidar header time: %lf \n",last_timestamp_imu, last_timestamp_lidar);
+    }
+
+    if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
+    {
+        timediff_set_flg = true;
+        timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+        printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
+    }
+
+    PointCloudXYZI::Ptr  pts(new PointCloudXYZI());
+    int offset_x = -1, offset_intensity = -1;
+    int offset_tag = -1, offset_line = -1, offset_ts = -1;
+    for (const auto& f : msg->fields)
+    {
+        if (f.name == "x")              offset_x = f.offset;
+        else if (f.name == "intensity") offset_intensity = f.offset;
+        else if (f.name == "tag")       offset_tag = f.offset;
+        else if (f.name == "line")      offset_line = f.offset;
+        else if (f.name == "offset_time") offset_ts = f.offset;
+    }
+
+    uint nPts = msg->width * msg->height;
+    pts->points.reserve(nPts);
+
+    uint valid_num = 0;
+    uint8_t tag, line;
+    uint32_t ts;
+    PointType pt, lastPt;
+    uint gap = p_pre->point_filter_num;
+
+    for (uint i = 1; i < nPts; i++)
+    {
+        const uint8_t* data = &msg->data[i * msg->point_step];
+        memcpy(&pt.x, data + offset_x, 3 * sizeof(float));
+        memcpy(&pt.intensity, data + offset_intensity, sizeof(float));
+        memcpy(&tag, data + offset_tag, sizeof(uint8_t));
+        memcpy(&line, data + offset_line, sizeof(uint8_t));
+        memcpy(&ts, data + offset_ts, sizeof(uint32_t));
+
+        if ((line < p_pre->N_SCANS) &&
+            ((tag & 0x30) == 0x10 || (tag & 0x30) == 0x00))
+        {
+            valid_num++;
+            if (valid_num % gap != 0) continue;
+            pt.curvature = (ts) * 1e-6;
+            if (((abs(pt.x - lastPt.x) > 1e-7) ||
+                    (abs(pt.y - lastPt.y) > 1e-7) ||
+                    (abs(pt.z - lastPt.z) > 1e-7)) &&
+                (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (p_pre->blind * p_pre->blind)))
+            {
+                pts->push_back(pt);
+            }
+
+            lastPt = pt;
+        }
+    }
+
+    lidar_buffer.push_back(pts);
+    time_buffer.push_back(cur_time);
+    last_timestamp_lidar = cur_time;
+    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+}
+
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    // printf("[imu_cbk] IMU header.stamp(s): %.6f\n", get_time_sec(msg_in->header.stamp));
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -625,13 +724,50 @@ void set_posestamp(T & out)
     
 }
 
+static Eigen::Isometry3d pose_msg_to_iso(const geometry_msgs::msg::Pose & p)
+{
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  T.translation() << p.position.x, p.position.y, p.position.z;
+  Eigen::Quaterniond q(
+    p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+  q.normalize();
+  T.linear() = q.toRotationMatrix();
+  return T;
+}
+
+static void iso_to_pose_msg(const Eigen::Isometry3d & T, geometry_msgs::msg::Pose & p)
+{
+  p.position.x = T.translation().x();
+  p.position.y = T.translation().y();
+  p.position.z = T.translation().z();
+  Eigen::Quaterniond q(T.linear());
+  p.orientation.w = q.w();
+  p.orientation.x = q.x();
+  p.orientation.y = q.y();
+  p.orientation.z = q.z();
+}
+
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.header.frame_id = odom_frame_id;
+    odomAftMapped.child_frame_id = odom_child_frame_id;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+    // 输出当前时间、odom时间和二者的差值
+    auto now_ros_time = rclcpp::Clock().now();
+    auto odom_ros_time = get_ros_time(lidar_end_time);
+    double now_sec = now_ros_time.seconds();
+    double odom_sec = odom_ros_time.seconds();
+    double diff_sec = now_sec - odom_sec;
+    std::cout << "Current ROS time: " << now_sec 
+              << ", Odom time: " << odom_sec 
+              << ", Difference: " << diff_sec << "s" << std::endl;
+
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+    if (g_compose_odom_to_base_link) {
+      Eigen::Isometry3d T_odom_livox = pose_msg_to_iso(odomAftMapped.pose.pose);
+      Eigen::Isometry3d T_odom_base = T_odom_livox * g_T_livox_base;
+      iso_to_pose_msg(T_odom_base, odomAftMapped.pose.pose);
+    }
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -643,10 +779,11 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
+    trans.header.frame_id = odom_frame_id;
+    trans.child_frame_id = odom_child_frame_id;
     trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
@@ -661,8 +798,13 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
+    if (g_compose_odom_to_base_link) {
+      Eigen::Isometry3d T_odom_livox = pose_msg_to_iso(msg_body_pose.pose);
+      Eigen::Isometry3d T_odom_base = T_odom_livox * g_T_livox_base;
+      iso_to_pose_msg(T_odom_base, msg_body_pose.pose);
+    }
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = odom_frame_id;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -804,6 +946,10 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<string>("publish.odom_frame_id", "camera_init");
+        this->declare_parameter<string>("publish.odom_child_frame_id", "body");
+        // Same 6 numbers as: ros2 run tf2_ros static_transform_publisher x y z yaw pitch roll base_link livox_frame
+        this->declare_parameter<vector<double>>("publish.base_to_livox_xyz_ypr", vector<double>());
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -840,6 +986,28 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<string>("publish.odom_frame_id", odom_frame_id, std::string("camera_init"));
+        this->get_parameter_or<string>("publish.odom_child_frame_id", odom_child_frame_id, std::string("body"));
+        {
+          vector<double> base_to_livox;
+          this->get_parameter_or<vector<double>>(
+            "publish.base_to_livox_xyz_ypr", base_to_livox, vector<double>());
+          if (base_to_livox.size() == 6) {
+            Eigen::Isometry3d T_base_livox = Eigen::Isometry3d::Identity();
+            T_base_livox.translation() << base_to_livox[0], base_to_livox[1], base_to_livox[2];
+            const double yaw = base_to_livox[3], pitch = base_to_livox[4], roll = base_to_livox[5];
+            Eigen::Quaterniond eq =
+              Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+              Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+              Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX());
+            T_base_livox.linear() = eq.normalized().toRotationMatrix();
+            g_T_livox_base = T_base_livox.inverse();
+            g_compose_odom_to_base_link = true;
+            RCLCPP_INFO(
+              this->get_logger(),
+              "FAST-LIO: livox pose composed to base_link via publish.base_to_livox_xyz_ypr (inverse of base_link->livox_frame)");
+          }
+        }
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -873,7 +1041,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+        path.header.frame_id = odom_frame_id;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -918,15 +1086,19 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
+        // preprocess.lidar_type: 1=AVIA(Livox CustomMsg), 4=MID360(PointCloud2 mid360LidHandler), else PointCloud2+standard_pcl_cbk
         if (p_pre->lidar_type == AVIA)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            RCLCPP_INFO(this->get_logger(), "LiDAR subscription: Livox CustomMsg, lidar_type=%d (AVIA)", p_pre->lidar_type);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                lid_topic, 200, standard_pcl_cbk);
+            RCLCPP_INFO(this->get_logger(), "LiDAR subscription: PointCloud2 standard_pcl_cbk, lidar_type=%d", p_pre->lidar_type);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -944,6 +1116,21 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        // 初始位姿 [x,y,z,yaw,pitch,roll]，与 base_link->livox_frame 外参一致时可与 publish.base_to_livox_xyz_ypr 对齐
+        {
+            Eigen::Vector3d pos(0.25, 0.0, 0.33);
+            const double yaw = 0.0, pitch = 0.37, roll = 0.007;
+            state_ikfom init_state;
+            init_state.pos = pos;
+            init_state.rot =
+                (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+                 Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+                 Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
+                    .toRotationMatrix();
+            kf.change_x(init_state);
+        }
+
+        
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -957,8 +1144,11 @@ public:
 private:
     void timer_callback()
     {
+
         if(sync_packages(Measures))
         {
+
+            double func_start_time = omp_get_wtime();
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -1104,7 +1294,12 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
+            double func_end_time = omp_get_wtime();
+            double elapsed_func_time = func_end_time - func_start_time;
+            RCLCPP_INFO(this->get_logger(), "timer_callback耗时: %.6f 秒", elapsed_func_time);
         }
+
+ 
     }
 
     void map_publish_callback()
